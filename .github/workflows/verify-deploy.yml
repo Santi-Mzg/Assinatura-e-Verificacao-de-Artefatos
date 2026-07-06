@@ -1,0 +1,173 @@
+name: Verify & Demo Attack Scenarios
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Scenario to run"
+        required: true
+        default: "happy-path"
+        type: choice
+        options:
+          - happy-path           # normal flow: signed image passes verification
+          - unauthorized-signer  # image signed by wrong identity is rejected
+          - unsigned-image       # unsigned image is rejected
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ── Scenario 1: Happy path ─────────────────────────────────────────────────
+  verify-signed-image:
+    name: "Scenario 1 – Happy path: verify legitimately signed image"
+    runs-on: ubuntu-latest
+    if: ${{ inputs.scenario == 'happy-path' }}
+
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.2.4
+
+      - name: Verify image signature
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "Verifying: $IMAGE"
+
+          cosign verify \
+            --certificate-identity-regexp \
+              "https://github.com/${{ github.repository }}/.github/workflows/build-sign.yml@refs/heads/main" \
+            --certificate-oidc-issuer \
+              "https://token.actions.githubusercontent.com" \
+            "$IMAGE" | jq .
+
+          echo "SUCCESS: Image is authentic and signed by the authorized workflow."
+
+      - name: Simulate deploy (only after successful verification)
+        run: |
+          echo "Deploying ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest to staging..."
+          echo "Deploy completed successfully."
+
+  # ── Scenario 2: Unauthorized signer ───────────────────────────────────────
+  reject-unauthorized-signer:
+    name: "Scenario 2 – Unauthorized signer: wrong identity is rejected"
+    runs-on: ubuntu-latest
+    if: ${{ inputs.scenario == 'unauthorized-signer' }}
+
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.2.4
+
+      - name: Attempt verification with wrong expected identity
+        id: verify
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "Attempting verification with WRONG expected identity..."
+
+          # We deliberately specify a different workflow path than the one
+          # that actually signed the image – simulating an attacker who
+          # signed the image from an unauthorized workflow.
+          cosign verify \
+            --certificate-identity-regexp \
+              "https://github.com/attacker/malicious-repo/.github/workflows/backdoor.yml@refs/heads/main" \
+            --certificate-oidc-issuer \
+              "https://token.actions.githubusercontent.com" \
+            "$IMAGE" && echo "verified=true" >> "$GITHUB_OUTPUT" \
+                     || echo "verified=false" >> "$GITHUB_OUTPUT"
+
+      - name: Block deploy – unauthorized signer detected
+        if: steps.verify.outputs.verified == 'false'
+        run: |
+          echo "BLOCKED: Signature does not match the authorized workflow identity."
+          echo "Expected signer: attacker/malicious-repo – NOT authorized."
+          echo "Deploy aborted. Security team has been notified."
+          exit 0   # exit 0 so the workflow shows the message; in production use exit 1
+
+  # ── Scenario 3: Unsigned image ────────────────────────────────────────────
+  reject-unsigned-image:
+    name: "Scenario 3 – Unsigned image: verification fails and deploy is blocked"
+    runs-on: ubuntu-latest
+    if: ${{ inputs.scenario == 'unsigned-image' }}
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push an UNSIGNED image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:unsigned-demo
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.2.4
+
+      - name: Attempt to verify the unsigned image (must fail)
+        id: verify
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:unsigned-demo"
+          echo "Attempting to verify UNSIGNED image: $IMAGE"
+
+          cosign verify \
+            --certificate-identity-regexp \
+              "https://github.com/${{ github.repository }}/.github/workflows/build-sign.yml@refs/heads/main" \
+            --certificate-oidc-issuer \
+              "https://token.actions.githubusercontent.com" \
+            "$IMAGE" && echo "verified=true" >> "$GITHUB_OUTPUT" \
+                     || echo "verified=false" >> "$GITHUB_OUTPUT"
+
+      - name: Block deploy – unsigned image
+        if: steps.verify.outputs.verified == 'false'
+        run: |
+          echo "BLOCKED: No valid signature found for this image."
+          echo "An image without a valid Sigstore signature cannot be deployed."
+          echo "Deploy aborted."
+          exit 0   # exit 0 so we see the output; in production use exit 1

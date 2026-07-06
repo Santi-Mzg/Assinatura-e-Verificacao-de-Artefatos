@@ -1,0 +1,210 @@
+# =============================================================================
+# Workflow 2: Verificação de Assinatura antes do Deploy
+# Demonstra os 3 cenários: ok, adulteração, assinante não autorizado
+# =============================================================================
+name: Verificar e Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: "Digest da imagem a verificar (sha256:...)"
+        required: true
+        type: string
+      scenario:
+        description: "Cenário de demonstração"
+        required: true
+        type: choice
+        options:
+          - "1-fluxo-feliz"
+          - "2-imagem-adulterada"
+          - "3-assinante-nao-autorizado"
+
+env:
+  REGISTRY:   ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  verify-and-deploy:
+    name: Verificar Assinatura e Deploy
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1. Checkout
+      # ------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # 2. Instalar Cosign
+      # ------------------------------------------------------------------
+      - name: Instalar Cosign
+        uses: sigstore/cosign-installer@v3
+
+      # ------------------------------------------------------------------
+      # 3. Login no GHCR
+      # ------------------------------------------------------------------
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ------------------------------------------------------------------
+      # 4. Definir imagem alvo conforme cenário
+      # ------------------------------------------------------------------
+      - name: Preparar cenário de demonstração
+        id: scenario
+        run: |
+          SCENARIO="${{ inputs.scenario }}"
+          BASE_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+
+          case "$SCENARIO" in
+            "1-fluxo-feliz")
+              # Imagem legítima assinada pelo pipeline oficial
+              TARGET="$BASE_IMAGE@${{ inputs.image_digest }}"
+              EXPECTED_IDENTITY="https://github.com/${{ github.repository }}/.github/workflows/build-sign.yml@refs/heads/main"
+              echo "target=$TARGET"               >> $GITHUB_OUTPUT
+              echo "expected_identity=$EXPECTED_IDENTITY" >> $GITHUB_OUTPUT
+              echo "scenario_desc=Fluxo feliz: imagem legítima assinada pelo pipeline oficial" >> $GITHUB_OUTPUT
+              ;;
+
+            "2-imagem-adulterada")
+              # Mesma imagem mas com digest modificado (simula adulteração)
+              FAKE_DIGEST="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+              TARGET="$BASE_IMAGE@$FAKE_DIGEST"
+              EXPECTED_IDENTITY="https://github.com/${{ github.repository }}/.github/workflows/build-sign.yml@refs/heads/main"
+              echo "target=$TARGET"               >> $GITHUB_OUTPUT
+              echo "expected_identity=$EXPECTED_IDENTITY" >> $GITHUB_OUTPUT
+              echo "scenario_desc=Adulteração: digest modificado manualmente" >> $GITHUB_OUTPUT
+              ;;
+
+            "3-assinante-nao-autorizado")
+              # Imagem legítima mas verifica com identidade de workflow errado
+              TARGET="$BASE_IMAGE@${{ inputs.image_digest }}"
+              EXPECTED_IDENTITY="https://github.com/atacante/repo-malicioso/.github/workflows/build.yml@refs/heads/main"
+              echo "target=$TARGET"               >> $GITHUB_OUTPUT
+              echo "expected_identity=$EXPECTED_IDENTITY" >> $GITHUB_OUTPUT
+              echo "scenario_desc=Assinante não autorizado: política de identidade rejeita a assinatura" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      # ------------------------------------------------------------------
+      # 5. Verificar assinatura com Cosign
+      # ------------------------------------------------------------------
+      - name: Verificar assinatura Cosign
+        id: verify
+        continue-on-error: true
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          echo "Cenário: ${{ steps.scenario.outputs.scenario_desc }}"
+          echo "Imagem alvo: ${{ steps.scenario.outputs.target }}"
+          echo "Identidade esperada: ${{ steps.scenario.outputs.expected_identity }}"
+          echo "---"
+
+          cosign verify \
+            --certificate-identity "${{ steps.scenario.outputs.expected_identity }}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${{ steps.scenario.outputs.target }}" \
+            2>&1 | tee verify-output.txt
+
+          echo "verify_exit_code=$?" >> $GITHUB_OUTPUT
+
+      # ------------------------------------------------------------------
+      # 6. Avaliar resultado e decidir sobre o deploy
+      # ------------------------------------------------------------------
+      - name: Avaliar resultado da verificação
+        id: decision
+        run: |
+          if [ "${{ steps.verify.outcome }}" == "success" ]; then
+            echo "resultado=APROVADO" >> $GITHUB_OUTPUT
+            echo "deploy=true"        >> $GITHUB_OUTPUT
+            echo "::notice::Assinatura válida. Prosseguindo para deploy."
+          else
+            echo "resultado=REJEITADO" >> $GITHUB_OUTPUT
+            echo "deploy=false"        >> $GITHUB_OUTPUT
+            echo "::error::Verificação de assinatura FALHOU. Deploy bloqueado."
+          fi
+
+      # ------------------------------------------------------------------
+      # 7. Deploy (somente se verificação aprovada)
+      # ------------------------------------------------------------------
+      - name: Deploy em staging
+        if: steps.decision.outputs.deploy == 'true'
+        run: |
+          echo "Iniciando deploy da imagem verificada..."
+          docker pull "${{ steps.scenario.outputs.target }}"
+          docker run -d \
+            --name secure-app-staging \
+            -p 5000:5000 \
+            -e APP_VERSION="1.0.${{ github.run_number }}" \
+            "${{ steps.scenario.outputs.target }}"
+
+          sleep 5
+          echo "Verificando saúde da aplicação..."
+          curl -f http://localhost:5000/health && echo "App saudável!"
+          curl -f http://localhost:5000/version
+
+          docker stop secure-app-staging
+          docker rm   secure-app-staging
+
+      # ------------------------------------------------------------------
+      # 8. Publicar resultado como artefato
+      # ------------------------------------------------------------------
+      - name: Publicar resultado da verificação
+        if: always()
+        run: |
+          cat > verification-result.json << EOF
+          {
+            "scenario":    "${{ inputs.scenario }}",
+            "description": "${{ steps.scenario.outputs.scenario_desc }}",
+            "image":       "${{ steps.scenario.outputs.target }}",
+            "resultado":   "${{ steps.decision.outputs.resultado }}",
+            "deploy":      "${{ steps.decision.outputs.deploy }}",
+            "timestamp":   "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          cat verification-result.json
+
+      - name: Upload resultado
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-result-${{ inputs.scenario }}
+          path: |
+            verification-result.json
+            verify-output.txt
+
+      # ------------------------------------------------------------------
+      # 9. Sumário
+      # ------------------------------------------------------------------
+      - name: Sumário do resultado
+        if: always()
+        run: |
+          EMOJI=$([[ "${{ steps.decision.outputs.resultado }}" == "APROVADO" ]] && echo "✅" || echo "🚫")
+          echo "## $EMOJI Verificação de Assinatura: ${{ steps.decision.outputs.resultado }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Cenário:** ${{ steps.scenario.outputs.scenario_desc }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Campo | Valor |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Imagem | \`${{ steps.scenario.outputs.target }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Resultado | **${{ steps.decision.outputs.resultado }}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy executado | ${{ steps.decision.outputs.deploy }} |" >> $GITHUB_STEP_SUMMARY
+
+      # ------------------------------------------------------------------
+      # 10. Falhar o job se verificação rejeitada (exceto cenários demo)
+      # ------------------------------------------------------------------
+      - name: Falhar se não autorizado
+        if: steps.decision.outputs.deploy == 'false' && inputs.scenario == '1-fluxo-feliz'
+        run: |
+          echo "Verificação falhou no cenário de fluxo feliz. Isso não deveria acontecer."
+          exit 1
