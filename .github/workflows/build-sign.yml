@@ -22,6 +22,8 @@ jobs:
       contents: read
       packages: write      # push para GHCR
       id-token: write      # necessário para keyless signing (OIDC)
+      attestations: write
+
 
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
